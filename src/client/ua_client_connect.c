@@ -4,6 +4,7 @@
  *
  *    Copyright 2017-2022 (c) Fraunhofer IOSB (Author: Julius Pfrommer)
  *    Copyright 2017-2019 (c) Fraunhofer IOSB (Author: Mark Giraud)
+ *    Copyright 2025 (c) Siemens AG (Author: Tin Raic)
  */
 
 #include <open62541/types.h>
@@ -11,6 +12,7 @@
 #include "open62541/transport_generated.h"
 #include "ua_client_internal.h"
 #include "../ua_types_encoding_binary.h"
+#include "../util/ua_ecc_encryptedsecret.h"
 
 /* Some OPC UA servers only return all Endpoints if the EndpointURL used during
  * the HEL/ACK handshake exactly matches -- including the path following the
@@ -31,6 +33,11 @@
 #define UA_MINMESSAGESIZE 8192
 #define UA_SESSION_LOCALNONCELENGTH 32
 #define MAX_DATA_SIZE 4096
+
+/* This is needed to save the server's ephemeral public key between the session creation (when the key is received) 
+ * and session activation, when the key is used 
+ * TODO: store the server's ephemeral key somewhere else, ideally in the channel context or the security policy context */
+static UA_ByteString serverEphemeralPubKeyEnc;
 
 static void initConnect(UA_Client *client);
 static UA_StatusCode createSessionAsync(UA_Client *client);
@@ -222,6 +229,347 @@ signUserTokenSignature(UA_Client *client, UA_SecurityPolicy *utsp,
     return retval;
 }
 
+static UA_StatusCode encryptUserIdentityTokenEcc(UA_Client *client, UA_ByteString *tokenData, UA_SecurityPolicy *sp) {
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+
+    /* New channel context with the client signing certificate from the encrypted secret.*/
+    /* Required to verify the signature since the application instance certificate isn't available here. */
+    /* Also required to hold the (one-time) symmetric key for encrypting and decrypting ECC encrypted secred */
+    void *tempChannelContext = NULL;
+    retval = sp->channelModule.
+        newContext(sp, &client->endpoint.serverCertificate, &tempChannelContext);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_NETWORK,
+                       "Could not instantiate the SecurityPolicy for the UserToken");
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_EccEncryptedSecretStruct secret;
+    
+    UA_EccEncryptedSecretStruct_init(&secret);
+
+    /* Filling out Common Header fields */
+    secret.typeId = UA_NODEID_NUMERIC(1, NODE_IDENTIFIER_NUMERIC_ECCENCRYPTEDSEC);
+    secret.encodingMask = 0x01;
+    secret.length = 0;
+    
+    retval = UA_String_copy(&sp->policyUri, &secret.securityPolicyUri);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to copy policy URI");
+        goto cleanup;
+    }
+    secret.length += secret.securityPolicyUri.length;
+    
+    retval = UA_ByteString_copy(&sp->localCertificate, &secret.certificate);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to copy local certificate");
+        goto cleanup;
+    }
+    secret.length += secret.certificate.length;
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Local certificate copied:");
+    debugPrint(&secret.certificate);
+    
+    secret.signingTime = UA_DateTime_now();
+    secret.length += sizeof(UA_DateTime);
+
+    /* TODO: use proper policy functions */
+    secret.keyDataLen = sp->symmetricModule.secureChannelNonceLength; /* Also ephemeral public key length */
+    secret.keyDataLen += sp->symmetricModule.secureChannelNonceLength; /* Also ephemeral public key length */
+    if(secret.keyDataLen == 0) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] KeyData length shouldn't be 0");
+        return UA_STATUSCODE_BADUNKNOWNRESPONSE;
+    }
+    secret.length += sizeof(UA_UInt16);
+
+    /* Filling out Policy Header (KeyData) */
+    retval = UA_ByteString_copy(&serverEphemeralPubKeyEnc, &secret.receiverPublicKey);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to copy server ephemeral key");
+        goto cleanup;
+    }
+    secret.length += serverEphemeralPubKeyEnc.length;
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Server ephemeral key copied: ");
+    debugPrint(&secret.receiverPublicKey);
+
+    /* TODO: use proper policy functions */
+    size_t ephKeyLen = sp->symmetricModule.secureChannelNonceLength; /* Also length of the ephemeral public key */
+    retval = UA_ByteString_allocBuffer(&secret.senderPublicKey, ephKeyLen);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to allocate buffer");
+        goto cleanup;
+    }
+
+    retval = sp->symmetricModule.generateNonce(sp->policyContext, &secret.senderPublicKey);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to generate local ephemeral key");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Client ephemeral key created and copied: ");
+    debugPrint(&secret.senderPublicKey);
+
+    /* Sanity check of KeyData length */
+    if(secret.keyDataLen != (secret.senderPublicKey.length + secret.receiverPublicKey.length) ) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Individual key lengths \
+        (%u and %u) don't add up to the total keyData length: (%u)", secret.senderPublicKey.length, secret.receiverPublicKey.length, secret.keyDataLen);
+        retval = UA_STATUSCODE_BAD;
+        goto cleanup;
+    }
+
+    secret.length += secret.receiverPublicKey.length;
+
+    /* Preparing payload */
+    retval = UA_ByteString_copy(&client->serverSessionNonce, &secret.nonce);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to copy server session nonce");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Server session nonce copied: ");
+    debugPrint(&secret.nonce);
+
+    /* Creating symmetric encryption key to encrypt the payload */
+    size_t symKeyLen = sp->symmetricModule.cryptoModule.encryptionAlgorithm.getLocalKeyLength(tempChannelContext);
+    size_t ivLen = sp->symmetricModule.cryptoModule.encryptionAlgorithm.getRemoteBlockSize(tempChannelContext);
+    if(symKeyLen == 0 || ivLen == 0) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] IV length or symmetric encryption key length is 0");
+        retval = UA_STATUSCODE_BAD;
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Local symmetric encrypting key length: %d", symKeyLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Initialization vector length: %d", ivLen);
+
+    UA_ByteString symEncKeyMaterial;
+    retval = UA_ByteString_allocBuffer(&symEncKeyMaterial, symKeyLen+ivLen);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to allocate buffer for key material");
+        goto cleanup;
+    }
+
+    /* This is a (temporary) measure so that the salt generation function (for the symmetric key derivation ) 
+     * knows that the salt is generated for session authentication (to choose the correct label) */
+    /* TODO: find a better way to signal symmetric key generation for session authentication */    
+    symEncKeyMaterial.data[0] = 0x03;
+    symEncKeyMaterial.data[1] = 0x03;
+    symEncKeyMaterial.data[2] = 0x04;
+    
+    /* Call logic for client (for session authentication): receiver public key is remote (server), sender public key is local (client)*/
+    retval = sp->symmetricModule.generateKey(sp->policyContext, &secret.receiverPublicKey, &secret.senderPublicKey, &symEncKeyMaterial);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to derive key material");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Derived key material: ");
+    debugPrint(&symEncKeyMaterial);
+    
+    /* Extracting the key and the initialization vector from the key material */
+    UA_ByteString encKey = {symKeyLen, symEncKeyMaterial.data};
+    UA_ByteString iv = {ivLen, &symEncKeyMaterial.data[symKeyLen]};
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Symmetric encryption key:");
+    debugPrint(&encKey);
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Initialization vector:");
+    debugPrint(&iv);
+
+    retval = sp->channelModule.setLocalSymEncryptingKey(tempChannelContext, &encKey);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to set symmetric encryption key");
+        goto cleanup;
+    }
+
+    retval = sp->channelModule.setLocalSymIv(tempChannelContext, &iv);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to set initialization vector");
+        goto cleanup;
+    }
+
+    /* Copy the data that needs to be protected (e.g. password) */
+    retval = UA_ByteString_copy(tokenData, &secret.secret);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to copy the secret");
+        goto cleanup;
+    }
+
+    /* Compute the padding size and pad the payload */
+    UA_UInt16 paddingLen = ivLen - ((secret.nonce.length + tokenData->length + sizeof(secret.payloadPaddingSize)) % ivLen);
+    if(tokenData->length + paddingLen < ivLen) {
+        paddingLen += ivLen;
+    }
+
+    secret.payloadPaddingSize = paddingLen;
+
+    secret.payloadPadding = (UA_Byte*) UA_malloc(paddingLen * sizeof(UA_Byte));
+    if(secret.payloadPadding == NULL) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to allocate the memory for the padding");
+        retval = UA_STATUSCODE_BADOUTOFMEMORY;
+        goto cleanup;
+    }
+
+    /* Least significant byte of padding size */
+    UA_Byte pad = paddingLen & 0xFF;
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Padding size: %u; Pad byte: 0x%02x", paddingLen, pad);
+
+    for(UA_Int16 i=0; i<paddingLen; i++) {
+        secret.payloadPadding[i] = pad;
+    }
+
+
+    /* Constructing payload, refer to https://reference.opcfoundation.org/Core/Part4/v105/docs/7.41.2.3 */
+    UA_ByteString payload;
+    UA_ByteString_init(&payload);
+
+    size_t payloadLen = secret.nonce.length + secret.secret.length + secret.payloadPaddingSize + sizeof(secret.payloadPaddingSize);
+    retval = UA_ByteString_allocBuffer(&payload, payloadLen);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to alocate the buffer for payload");
+        goto cleanup;
+    }
+
+    UA_Byte* bufPos = payload.data;
+    memcpy(bufPos, secret.nonce.data, secret.nonce.length);
+    bufPos += secret.nonce.length;
+    memcpy(bufPos, secret.secret.data, secret.secret.length);
+    bufPos += secret.secret.length;
+    memcpy(bufPos, secret.payloadPadding, secret.payloadPaddingSize);
+    bufPos += secret.payloadPaddingSize;
+    memcpy(bufPos, &paddingLen, sizeof(paddingLen)); 
+    
+    /* Don't print payload to encrypt, used only for debugging purposes */
+    /* UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Payload to encrypt (len: %u):", payload.length);
+     * debugPrint(&payload); */
+
+    retval = sp->symmetricModule.cryptoModule.encryptionAlgorithm.encrypt(tempChannelContext, &payload);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to encrypt the payload");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Encrypted payload (len: %u):", payload.length);
+    debugPrint(&payload);
+
+    secret.length += payload.length;
+
+    /* Init the EccEncryptedSecret (serialized) and calculate the lengths*/
+    UA_EccEncryptedSecret eccEncSecSer;
+
+    size_t commonHeaderSerLen = UA_EccEncryptedSecret_getCommonHeaderSize(&secret);
+    size_t signatureLen = sp->asymmetricModule.cryptoModule.signatureAlgorithm.getLocalSignatureSize(tempChannelContext);
+    size_t policyHeaderSerLen = UA_EccEncryptedSecret_getPolicyHeaderSize(&secret);
+    size_t payloadSerLen = UA_ByteString_calcSizeBinary(&payload);
+    size_t signedDataLen = commonHeaderSerLen + policyHeaderSerLen + payloadSerLen;
+    size_t totalLen = signedDataLen + signatureLen;
+
+    secret.length += signatureLen;
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Unserialized length from the length member: %u", secret.length);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Common Header (serialized) length: %u", commonHeaderSerLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Policy Header (serialized) length: %u", policyHeaderSerLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Payload to encrypt (serialized) length: %u", payloadSerLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Signature length: %u:", signatureLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Data to Sign length %u:", signedDataLen);
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Total EccEncryptedSecret length: %u", totalLen);
+
+    /* Init the EccEncryptedSecret */
+    retval = UA_ByteString_allocBuffer(&eccEncSecSer, totalLen);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to allocate the buffer");
+        goto cleanup;
+    }
+
+    /* Serialize the Common Header and put it in EccEncryptedSecret */
+    bufPos = eccEncSecSer.data;
+    UA_Byte* bufEnd = &eccEncSecSer.data[commonHeaderSerLen];
+    retval = UA_EccEncryptedSecret_serializeCommonHeader(&secret, &bufPos, bufEnd);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to serialize the common header");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] After Common Header serialization:");
+    debugPrint(&eccEncSecSer);
+
+    /* Serialize the policy header (key data) */
+    bufEnd = bufPos + policyHeaderSerLen;
+    retval = UA_EccEncryptedSecret_serializePolicyHeader(&secret, &bufPos, bufEnd);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to serialize the policy header (key data)");
+        goto cleanup;
+    }
+    
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] After serializing the policy header (key data):");
+    debugPrint(&eccEncSecSer);
+
+    /* Serialize the payload */
+    bufEnd = bufPos + payloadSerLen;
+    retval = UA_ByteString_encodeBinary(&payload, &bufPos, bufEnd);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to serialize the payload");
+        goto cleanup;
+    }
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] After serializing the payload:");
+    debugPrint(&eccEncSecSer);
+
+    /* Sign */
+    UA_ByteString sig;
+    UA_ByteString_init(&sig);
+
+    retval = UA_ByteString_allocBuffer(&sig, signatureLen);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to allocate signature buffer");
+        goto cleanup;
+    }
+
+    eccEncSecSer.length = signedDataLen; /* Temporarily change length for signing purposes */
+    retval = sp->asymmetricModule.cryptoModule.signatureAlgorithm.sign(tempChannelContext, &eccEncSecSer, &sig);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Failed to compute the signature");
+        goto cleanup;
+    }
+    eccEncSecSer.length = totalLen;
+
+    /* Copy the signature */
+    memcpy(bufPos, sig.data, sig.length);
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] Signature:");
+    debugPrint(&sig);
+
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SESSION, "[EncryptedSecret] End:");
+    debugPrint(&eccEncSecSer);
+
+    /* Set output */
+    UA_ByteString_clear(tokenData);
+    *tokenData = eccEncSecSer;
+
+cleanup:
+    UA_EccEncryptedSecretStruct_clear(&secret);
+    UA_ByteString_clear(&serverEphemeralPubKeyEnc);
+
+    if(symEncKeyMaterial.data != NULL) {
+        UA_ByteString_clear(&symEncKeyMaterial);
+    }
+    if(payload.data != NULL) {
+        UA_ByteString_clear(&payload);
+    }
+    if(sig.data != NULL) {
+        UA_ByteString_clear(&sig);
+    }
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_ByteString_clear(&eccEncSecSer);
+    }
+    if(tempChannelContext != NULL) {
+        sp->channelModule.deleteContext(tempChannelContext);
+    }
+
+    return retval;
+}
+
 /* UserName and IssuedIdentity are transferred encrypted.
  * X509 and Anonymous are not. */
 static UA_StatusCode
@@ -241,64 +589,71 @@ encryptUserIdentityToken(UA_Client *client, UA_SecurityPolicy *utsp,
         return UA_STATUSCODE_GOOD;
     }
 
-    /* Create a temp channel context */
-
-    void *channelContext;
-    UA_StatusCode retval = utsp->channelModule.
-        newContext(utsp, &client->endpoint.serverCertificate, &channelContext);
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_NETWORK,
-                       "Could not instantiate the SecurityPolicy for the UserToken");
-        return UA_STATUSCODE_BADINTERNALERROR;
-    }
-
-    /* Compute the encrypted length (at least one byte padding) */
-    size_t plainTextBlockSize = utsp->asymmetricModule.cryptoModule.
-        encryptionAlgorithm.getRemotePlainTextBlockSize(channelContext);
-    size_t encryptedBlockSize = utsp->asymmetricModule.cryptoModule.
-        encryptionAlgorithm.getRemoteBlockSize(channelContext);
-    UA_UInt32 length = (UA_UInt32)(tokenData->length + client->serverSessionNonce.length);
-    UA_UInt32 totalLength = length + 4; /* Including the length field */
-    size_t blocks = totalLength / plainTextBlockSize;
-    if(totalLength % plainTextBlockSize != 0)
-        blocks++;
-    size_t encryptedLength = blocks * encryptedBlockSize;
-
-    /* Allocate memory for encryption overhead */
-    UA_ByteString encrypted;
-    retval = UA_ByteString_allocBuffer(&encrypted, encryptedLength);
-    if(retval != UA_STATUSCODE_GOOD) {
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    if(UA_SecurityPolicy_isEccPolicy(utsp->policyUri)) {
+        retval = encryptUserIdentityTokenEcc(client, tokenData, utsp);
+        if(retval != UA_STATUSCODE_GOOD) {
+            return retval;
+        }
+    } else {
+        /* Create a temp channel context */
+        void *channelContext;
+        retval = utsp->channelModule.
+            newContext(utsp, &client->endpoint.serverCertificate, &channelContext);
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_NETWORK,
+                           "Could not instantiate the SecurityPolicy for the UserToken");
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+    
+        /* Compute the encrypted length (at least one byte padding) */
+        size_t plainTextBlockSize = utsp->asymmetricModule.cryptoModule.
+            encryptionAlgorithm.getRemotePlainTextBlockSize(channelContext);
+        size_t encryptedBlockSize = utsp->asymmetricModule.cryptoModule.
+            encryptionAlgorithm.getRemoteBlockSize(channelContext);
+        UA_UInt32 length = (UA_UInt32)(tokenData->length + client->serverSessionNonce.length);
+        UA_UInt32 totalLength = length + 4; /* Including the length field */
+        size_t blocks = totalLength / plainTextBlockSize;
+        if(totalLength % plainTextBlockSize != 0)
+            blocks++;
+        size_t encryptedLength = blocks * encryptedBlockSize;
+    
+        /* Allocate memory for encryption overhead */
+        UA_ByteString encrypted;
+        retval = UA_ByteString_allocBuffer(&encrypted, encryptedLength);
+        if(retval != UA_STATUSCODE_GOOD) {
+            utsp->channelModule.deleteContext(channelContext);
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        }
+    
+        UA_Byte *pos = encrypted.data;
+        const UA_Byte *end = &encrypted.data[encrypted.length];
+        retval = UA_UInt32_encodeBinary(&length, &pos, end);
+        memcpy(pos, tokenData->data, tokenData->length);
+        memcpy(&pos[tokenData->length], client->serverSessionNonce.data,
+               client->serverSessionNonce.length);
+        UA_assert(retval == UA_STATUSCODE_GOOD);
+    
+        /* Add padding
+         *
+         * 7.36.2.2 Legacy Encrypted Token Secret Format: A Client should not add any
+         * padding after the secret. If a Client adds padding then all bytes shall
+         * be zero. A Server shall check for padding added by Clients and ensure
+         * that all padding bytes are zeros. */
+        size_t paddedLength = plainTextBlockSize * blocks;
+        for(size_t i = totalLength; i < paddedLength; i++)
+            encrypted.data[i] = 0;
+        encrypted.length = paddedLength;
+    
+        retval = utsp->asymmetricModule.cryptoModule.encryptionAlgorithm.
+            encrypt(channelContext, &encrypted);
+        encrypted.length = encryptedLength;
+        UA_ByteString_clear(tokenData);
+        *tokenData = encrypted;
+    
+        /* Delete the temporary channel context */
         utsp->channelModule.deleteContext(channelContext);
-        return UA_STATUSCODE_BADOUTOFMEMORY;
     }
-
-    UA_Byte *pos = encrypted.data;
-    const UA_Byte *end = &encrypted.data[encrypted.length];
-    retval = UA_UInt32_encodeBinary(&length, &pos, end);
-    memcpy(pos, tokenData->data, tokenData->length);
-    memcpy(&pos[tokenData->length], client->serverSessionNonce.data,
-           client->serverSessionNonce.length);
-    UA_assert(retval == UA_STATUSCODE_GOOD);
-
-    /* Add padding
-     *
-     * 7.36.2.2 Legacy Encrypted Token Secret Format: A Client should not add any
-     * padding after the secret. If a Client adds padding then all bytes shall
-     * be zero. A Server shall check for padding added by Clients and ensure
-     * that all padding bytes are zeros. */
-    size_t paddedLength = plainTextBlockSize * blocks;
-    for(size_t i = totalLength; i < paddedLength; i++)
-        encrypted.data[i] = 0;
-    encrypted.length = paddedLength;
-
-    retval = utsp->asymmetricModule.cryptoModule.encryptionAlgorithm.
-        encrypt(channelContext, &encrypted);
-    encrypted.length = encryptedLength;
-    UA_ByteString_clear(tokenData);
-    *tokenData = encrypted;
-
-    /* Delete the temporary channel context */
-    utsp->channelModule.deleteContext(channelContext);
 
     if(iit) {
         retval |= UA_String_copy(&utsp->asymmetricModule.cryptoModule.encryptionAlgorithm.uri,
@@ -830,6 +1185,20 @@ responseActivateSession(UA_Client *client, void *userdata,
     UA_ByteString_clear(&client->serverSessionNonce);
     client->serverSessionNonce = ar->serverNonce;
     UA_ByteString_init(&ar->serverNonce);
+
+    /* Extract the server's ephemeral public key from the response */
+    if(ar->responseHeader.additionalHeader.encoding != UA_EXTENSIONOBJECT_ENCODED_NOBODY
+        && ar->responseHeader.additionalHeader.content.encoded.typeId.identifier.numeric == NODE_IDENTIFIER_NUMERIC_EPHKEY) {
+        
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SESSION, "[ActivateSession] Server Ephemeral Key in the response");
+        
+        UA_ByteString_init(&serverEphemeralPubKeyEnc);
+        client->connectStatus |= UA_ByteString_copy(&ar->responseHeader.additionalHeader.content.encoded.body, &serverEphemeralPubKeyEnc);
+        if(client->connectStatus != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[ActivateSession] Failed to obtain server's ephemeral key from the response");
+            return;
+        }
+    }
 
     client->sessionState = UA_SESSIONSTATE_ACTIVATED;
     notifyClientState(client);
@@ -1387,6 +1756,21 @@ createSessionCallback(UA_Client *client, void *userdata,
                           &client->authenticationToken);
     if(res != UA_STATUSCODE_GOOD)
         goto cleanup;
+
+
+    /* Extract the server's ephemeral public key from the response */
+    if(sessionResponse->responseHeader.additionalHeader.encoding != UA_EXTENSIONOBJECT_ENCODED_NOBODY
+        && sessionResponse->responseHeader.additionalHeader.content.encoded.typeId.identifier.numeric == NODE_IDENTIFIER_NUMERIC_EPHKEY) {
+        
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SESSION, "[ActivateSession] Server Ephemeral Key in the response");
+        
+        UA_ByteString_init(&serverEphemeralPubKeyEnc);
+        res |= UA_ByteString_copy(&sessionResponse->responseHeader.additionalHeader.content.encoded.body, &serverEphemeralPubKeyEnc);
+        if(res != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SESSION, "[ActivateSession] Failed to obtain server's ephemeral key from the response");
+            goto cleanup;
+        }
+    }
 
     /* Activate the new Session */
     client->sessionState = UA_SESSIONSTATE_CREATED;
@@ -2404,6 +2788,9 @@ cleanupSession(UA_Client *client) {
 #endif
 
     client->sessionState = UA_SESSIONSTATE_CLOSED;
+
+    /* Clean the latest server's ephemeral public key received in the Activate Session response. */
+    UA_ByteString_clear(&serverEphemeralPubKeyEnc);
 }
 
 static void
